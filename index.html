@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Freelko — Trabaja. Cobra. Crece.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp }                          from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithPopup, signOut,
+         GoogleAuthProvider, onAuthStateChanged,
+         createUserWithEmailAndPassword,
+         signInWithEmailAndPassword,
+         updateProfile }                          from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, doc, setDoc, addDoc,
+         getDoc, getDocs, updateDoc,
+         collection, serverTimestamp,
+         query, where, orderBy, limit }           from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey:            "AIzaSyDdsAtz8zOIBecV2Z9hBZB3c08Fh8o_UPo",
+  authDomain:        "flowlance-190ac.firebaseapp.com",
+  projectId:         "flowlance-190ac",
+  storageBucket:     "flowlance-190ac.firebasestorage.app",
+  messagingSenderId: "1003219322737",
+  appId:             "1:1003219322737:web:d9519fc9bc2f443cf2d8d0"
+};
+const app   = initializeApp(firebaseConfig);
+const auth  = getAuth(app);
+const db    = getFirestore(app);
+const gProv = new GoogleAuthProvider();
+gProv.setCustomParameters({ prompt: 'select_account' });
+
+let usuarioActual     = null;
+let datosUsuario      = {};
+let proyectoPendiente = null;
+
+const CATS = {
+  dev: { label:'Desarrollo & Tech',    badge:'badge-dev', icono:'💻' },
+  dis: { label:'Diseño & Creatividad', badge:'badge-dis', icono:'🎨' },
+  mkt: { label:'Marketing Digital',    badge:'badge-mkt', icono:'📣' },
+  red: { label:'Redacción',            badge:'badge-red', icono:'✍️' },
+  vid: { label:'Video & Animación',    badge:'badge-vid', icono:'🎬' },
+  fin: { label:'Finanzas & Negocios',  badge:'badge-fin', icono:'💼' },
+};
+
+// ── Auth ────────────────────────────────────────────────
+onAuthStateChanged(auth, async user => {
+  if (user) {
+    usuarioActual = user;
+    const snap = await getDoc(doc(db,"users",user.uid)).catch(()=>null);
+    datosUsuario  = snap?.exists() ? snap.data() : {};
+    actualizarNav(user, datosUsuario);
+    cerrarModalAuth();
+    if (proyectoPendiente) {
+      const pid = proyectoPendiente; proyectoPendiente = null;
+      setTimeout(()=>verProyecto(pid), 200);
+    }
+  } else {
+    usuarioActual = null; datosUsuario = {};
+    actualizarNav(null, {});
+  }
+});
+
+async function guardarUser(user, rol, nombre) {
+  try {
+    const ref  = doc(db,"users",user.uid);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) {
+      await setDoc(ref,{
+        uid:user.uid, nombre:nombre||user.displayName||"Usuario",
+        email:user.email, rol:rol||"freelancer",
+        avatar:user.photoURL||"", bio:"", skills:[],
+        rating:0, totalJobs:0, createdAt:serverTimestamp()
+      });
+      datosUsuario = { uid:user.uid, nombre, email:user.email, rol };
+    }
+  } catch(e){ console.warn("guardarUser:", e.code); }
+}
+
+window.loginGoogle = async () => {
+  const rol = document.querySelector('.rol-btn.activo')?.dataset.rol||'freelancer';
+  try {
+    const r = await signInWithPopup(auth, gProv);
+    await guardarUser(r.user, rol, r.user.displayName);
+  } catch(e){ if(e.code!=='auth/popup-closed-by-user') mostrarError(tradError(e.code)); }
+};
+window.registrar = async () => {
+  const nombre=document.getElementById('r-nombre').value.trim();
+  const email =document.getElementById('r-email').value.trim();
+  const pass  =document.getElementById('r-pass').value;
+  const rol   =document.querySelector('.rol-btn.activo')?.dataset.rol||'freelancer';
+  if(!nombre) return mostrarError('Escribe tu nombre');
+  if(!email)  return mostrarError('Escribe tu correo');
+  if(pass.length<8) return mostrarError('Mínimo 8 caracteres');
+  setBusy(true);
+  try {
+    const c = await createUserWithEmailAndPassword(auth,email,pass);
+    await updateProfile(c.user,{displayName:nombre});
+    await guardarUser(c.user,rol,nombre);
+  } catch(e){ mostrarError(tradError(e.code)); } finally { setBusy(false); }
+};
+window.login = async () => {
+  const email=document.getElementById('l-email').value.trim();
+  const pass =document.getElementById('l-pass').value;
+  if(!email||!pass) return mostrarError('Completa los campos');
+  setBusy(true);
+  try { await signInWithEmailAndPassword(auth,email,pass); }
+  catch(e){ mostrarError(tradError(e.code)); } finally { setBusy(false); }
+};
+window.logout = () => { signOut(auth); mostrarPagina('proyectos'); cargarProyectos(); };
+
+// ── Páginas ─────────────────────────────────────────────
+window.mostrarPagina = id => {
+  document.querySelectorAll('.pagina').forEach(p=>p.style.display='none');
+  document.getElementById('pag-'+id).style.display='block';
+  window.scrollTo(0,0);
+  cerrarMenus();
+};
+
+// ── Cargar proyectos SOLO reales de Firestore ───────────
+window.cargarProyectos = async (filtrocat='todos') => {
+  const lista = document.getElementById('lista-proyectos');
+  const cont  = document.getElementById('cont-proyectos');
+  lista.innerHTML = `<div class="cargando"><div class="spinner"></div><p>Cargando proyectos...</p></div>`;
+
+  try {
+    const q    = query(collection(db,'projects'), where('estado','==','activo'), orderBy('createdAt','desc'), limit(50));
+    const snap = await getDocs(q);
+    let proyectos = snap.docs.map(d=>({id:d.id,...d.data()}));
+    if(filtrocat!=='todos') proyectos = proyectos.filter(p=>p.cat===filtrocat);
+
+    if(proyectos.length===0){
+      cont.textContent = '0 proyectos';
+      lista.innerHTML = `
+        <div class="empty-lista">
+          <div class="empty-icon">🚀</div>
+          <h3>¡Sé el primero en publicar!</h3>
+          <p>Freelko está en beta. Aún no hay proyectos publicados.<br>Si eres cliente, publica el primero y recibe propuestas de freelancers reales.</p>
+          <button class="btn-azul" style="margin-top:20px" onclick="mostrarFormProyecto()">Publicar el primer proyecto →</button>
+        </div>`;
+      return;
+    }
+    cont.textContent = proyectos.length+' proyecto'+(proyectos.length===1?'':'s')+' activo'+(proyectos.length===1?'':'s');
+    lista.innerHTML = proyectos.map(p=>renderCard(p)).join('');
+  } catch(e){
+    console.warn('cargarProyectos:', e.code);
+    lista.innerHTML = `<div class="empty-lista"><div class="empty-icon">⚠️</div><p>Error al cargar proyectos. Verifica tu conexión.</p></div>`;
+  }
+};
+
+function renderCard(p) {
+  const cat  = CATS[p.cat]||CATS.dev;
+  const min  = Number(p.presupMin||0).toLocaleString();
+  const max  = Number(p.presupMax||0).toLocaleString();
+  const hace = tiempoAtras(p.createdAt?.toDate?.());
+  const cli  = p.clienteNombre||'Cliente';
+  const ini  = cli[0].toUpperCase();
+  const color= p.clienteColor||colorHash(cli);
+  return `
+    <div class="proyecto-card" onclick="verProyecto('${p.id}')">
+      <div class="card-top">
+        <div class="card-info">
+          <span class="cat-badge ${cat.badge}">${cat.icono} ${cat.label}</span>
+          <div class="card-titulo">${p.titulo}</div>
+          <div class="card-desc">${(p.desc||'').substring(0,160)}${p.desc?.length>160?'...':''}</div>
+        </div>
+        <div class="card-presupuesto">
+          <div class="presupuesto-valor">$${min}–$${max}</div>
+          <div class="presupuesto-tipo">USD · ${p.modalidad||'Precio fijo'}</div>
+        </div>
+      </div>
+      ${(p.tags||[]).length>0?`<div class="card-tags">${(p.tags||[]).slice(0,5).map(t=>`<span class="tag">${t}</span>`).join('')}</div>`:''}
+      <div class="card-footer">
+        <div class="cliente-info">
+          <div class="cliente-av" style="background:${color}">${ini}</div>
+          <div>
+            <div class="cliente-nombre">${cli}</div>
+            <div class="cliente-rating">Publicado ${hace}</div>
+          </div>
+        </div>
+        <div class="card-meta">
+          <span class="meta-item">👥 ${p.propuestas||0} propuestas</span>
+          <button class="btn-ver-proyecto" onclick="event.stopPropagation();verProyecto('${p.id}')">Ver proyecto →</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── Ver detalle ─────────────────────────────────────────
+window.verProyecto = async id => {
+  let p = null;
+  try {
+    const snap = await getDoc(doc(db,'projects',id));
+    if(snap.exists()) p = {id:snap.id,...snap.data()};
+  } catch(e){}
+  if(!p) return;
+
+  const cat      = CATS[p.cat]||CATS.dev;
+  const logueado = !!usuarioActual;
+  const esPropio = logueado && p.clienteId===usuarioActual?.uid;
+  const esCliente= logueado && datosUsuario.rol==='client';
+  const min = Number(p.presupMin||0).toLocaleString();
+  const max = Number(p.presupMax||0).toLocaleString();
+  const desc= (p.descLarga||p.desc||'').replace(/\n/g,'<br>');
+  const cli = p.clienteNombre||'Cliente';
+
+  document.getElementById('pag-detalle').innerHTML = `
+    <div class="detalle-wrap">
+      <button class="btn-back" onclick="mostrarPagina('proyectos')">← Volver a proyectos</button>
+      <div class="detalle-grid">
+        <div class="detalle-main">
+          <span class="cat-badge ${cat.badge}">${cat.icono} ${cat.label}</span>
+          <h1 class="detalle-titulo">${p.titulo}</h1>
+          <div class="detalle-meta-row">
+            <span class="meta-chip">🕐 Publicado ${tiempoAtras(p.createdAt?.toDate?.())}</span>
+            <span class="meta-chip">👥 ${p.propuestas||0} propuestas</span>
+            <span class="meta-chip">📋 ${p.modalidad||'Precio fijo'}</span>
+            ${p.plazo_entrega?`<span class="meta-chip">⏱ ${p.plazo_entrega}</span>`:''}
+          </div>
+          <div class="detalle-seccion">
+            <h2>Descripción del proyecto</h2>
+            <p>${desc}</p>
+          </div>
+          ${(p.tags||[]).length>0?`
+          <div class="detalle-seccion">
+            <h2>Habilidades requeridas</h2>
+            <div class="tags-wrap">${p.tags.map(t=>`<span class="tag">${t}</span>`).join('')}</div>
+          </div>`:''}
+          <div class="detalle-seccion">
+            <h2>Sobre el cliente</h2>
+            <div class="cliente-perfil">
+              <div class="cliente-av-lg" style="background:${p.clienteColor||colorHash(cli)}">${cli[0].toUpperCase()}</div>
+              <div>
+                <div class="cliente-nombre-lg">${cli}</div>
+                <div class="cliente-stats">Miembro de Freelko · Cuenta verificada</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="detalle-sidebar">
+          <div class="propuesta-card">
+            <div class="presupuesto-display">
+              <span class="presup-label">Presupuesto del cliente</span>
+              <span class="presup-valor">$${min} – $${max} USD</span>
+              <span class="presup-nota">Tú cobras el 100% · El cliente paga +8% a Freelko</span>
+            </div>
+            ${esPropio?`
+              <div style="text-align:center;padding:8px 0">
+                <p style="font-size:.88rem;color:var(--muted);margin-bottom:16px">Este es tu proyecto publicado.</p>
+                <button class="btn-ghost-full" onclick="abrirDashboard()">Ver propuestas recibidas</button>
+              </div>
+            `:esCliente?`
+              <div style="text-align:center;padding:8px 0">
+                <p style="font-size:.88rem;color:var(--muted);margin-bottom:16px">Eres cliente. Para aplicar a proyectos necesitas una cuenta de freelancer.</p>
+              </div>
+            `:logueado?`
+              <div id="form-prop-${id}">
+                <h3 style="font-size:.95rem;font-weight:700;margin-bottom:16px">Enviar propuesta</h3>
+                <div class="form-group">
+                  <label class="form-label">Tu precio (USD) <span style="color:#ef4444">*</span></label>
+                  <div style="position:relative;display:flex;align-items:center">
+                    <span style="position:absolute;left:14px;color:var(--muted);font-weight:600">$</span>
+                    <input type="number" id="pp-precio" class="form-input" style="padding-left:28px" placeholder="ej: 500" min="1"
+                      oninput="var v=+this.value;document.getElementById('pp-cli').textContent=v>0?(v*1.08).toFixed(2):'—'">
+                  </div>
+                  <p style="font-size:.75rem;color:var(--muted);margin-top:4px">El cliente pagará $<span id="pp-cli">—</span> USD (incluye 8%)</p>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Tu propuesta <span style="color:#ef4444">*</span> <span style="color:var(--muted);font-weight:400">(mín. 50 caracteres)</span></label>
+                  <textarea id="pp-msg" class="form-textarea" placeholder="Explica tu experiencia, enfoque y por qué eres la mejor opción para este proyecto..." rows="5"
+                    oninput="var n=this.value.length;var el=document.getElementById('pp-chars');el.textContent=n+'/50 mínimo';el.style.color=n>=50?'#16a34a':'#9ca3af'"></textarea>
+                  <p id="pp-chars" style="font-size:.72rem;color:#9ca3af;text-align:right;margin-top:3px">0/50 mínimo</p>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Plazo de entrega <span style="color:#ef4444">*</span></label>
+                  <select id="pp-plazo" class="form-input">
+                    <option value="">Selecciona...</option>
+                    <option>Menos de 1 semana</option>
+                    <option>1 a 2 semanas</option>
+                    <option>3 a 4 semanas</option>
+                    <option>1 a 2 meses</option>
+                    <option>Más de 2 meses</option>
+                  </select>
+                </div>
+                <div id="pp-err" style="display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:10px 14px;border-radius:8px;font-size:.82rem;margin-bottom:12px"></div>
+                <button class="btn-azul-full" onclick="enviarPropuesta('${id}')">Enviar propuesta →</button>
+                <p style="font-size:.72rem;color:var(--muted);text-align:center;margin-top:8px">Freelko no te cobra comisión. Siempre es gratis aplicar.</p>
+              </div>
+            `:`
+              <div style="text-align:center;padding:8px 0">
+                <p style="font-size:.88rem;color:var(--muted);margin-bottom:16px;line-height:1.6">Regístrate gratis para enviar tu propuesta a este proyecto.</p>
+                <button class="btn-azul-full" onclick="proyectoPendiente='${id}';abrirAuth('reg')">Únete gratis y aplica →</button>
+                <button class="btn-ghost-full" onclick="proyectoPendiente='${id}';abrirAuth('login')">Ya tengo cuenta</button>
+              </div>
+            `}
+          </div>
+          <div class="stats-card">
+            <div class="stat-row"><span>Propuestas recibidas</span><strong>${p.propuestas||0}</strong></div>
+            <div class="stat-row"><span>Tu comisión</span><strong style="color:var(--verde)">$0 siempre</strong></div>
+            <div class="stat-row"><span>Comisión al cliente</span><strong>8%</strong></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  mostrarPagina('detalle');
+};
+
+// ── Enviar propuesta ────────────────────────────────────
+window.enviarPropuesta = async id => {
+  const precio  = parseFloat(document.getElementById('pp-precio').value);
+  const mensaje = document.getElementById('pp-msg').value.trim();
+  const plazo   = document.getElementById('pp-plazo').value;
+  const errEl   = document.getElementById('pp-err');
+  const err = msg => { errEl.textContent=msg; errEl.style.display='block'; setTimeout(()=>errEl.style.display='none',4000); };
+  if(!precio||precio<1) return err('Escribe tu precio en USD');
+  if(mensaje.length<50) return err('El mensaje debe tener mínimo 50 caracteres');
+  if(!plazo)            return err('Selecciona el tiempo de entrega');
+  if(!usuarioActual)    return err('Debes iniciar sesión');
+  const btn=document.querySelector('.btn-azul-full'); btn.disabled=true; btn.textContent='Enviando...';
+  try {
+    await addDoc(collection(db,'proposals'),{
+      projectId:id, freelancerId:usuarioActual.uid,
+      freelancerNombre:datosUsuario.nombre||usuarioActual.displayName||usuarioActual.email,
+      freelancerEmail:usuarioActual.email,
+      precio, precioCliente:parseFloat((precio*1.08).toFixed(2)),
+      mensaje, plazo, estado:'pendiente', createdAt:serverTimestamp()
+    });
+    try { const r=await getDoc(doc(db,'projects',id)); if(r.exists()) await updateDoc(doc(db,'projects',id),{propuestas:(r.data().propuestas||0)+1}); } catch(e2){}
+    document.getElementById(`form-prop-${id}`).innerHTML=`
+      <div style="text-align:center;padding:24px 0">
+        <div style="font-size:2.5rem;margin-bottom:12px">🎉</div>
+        <h3 style="color:var(--verde);margin-bottom:10px;font-size:1.1rem">¡Propuesta enviada!</h3>
+        <p style="font-size:.88rem;color:var(--muted);line-height:1.7">Tu propuesta de <strong>$${precio.toLocaleString()} USD</strong> fue enviada.<br>El cliente pagará $${(precio*1.08).toFixed(2)} USD.<br>Te avisaremos cuando responda.</p>
+        <button class="btn-ghost-full" style="margin-top:16px" onclick="mostrarPagina('proyectos');cargarProyectos()">Ver más proyectos</button>
+        <button class="btn-azul-full" style="margin-top:8px" onclick="abrirDashboard()">Ver mis propuestas</button>
+      </div>`;
+  } catch(e){ btn.disabled=false; btn.textContent='Enviar propuesta →'; err('Error al enviar. Intenta de nuevo.'); }
+};
+
+// ── Publicar proyecto ───────────────────────────────────
+window.mostrarFormProyecto = () => {
+  if(!usuarioActual){ proyectoPendiente='pub'; abrirAuth('reg'); return; }
+  if(datosUsuario.rol!=='client'){
+    mostrarToast('Para publicar proyectos necesitas una cuenta de cliente. Regístrate con el rol "Soy cliente".','warn');
+    return;
+  }
+  mostrarPagina('publicar');
+};
+
+window.publicarProyecto = async () => {
+  if(!usuarioActual||datosUsuario.rol!=='client') return;
+  const titulo=document.getElementById('pub-titulo').value.trim();
+  const cat=document.getElementById('pub-cat').value;
+  const desc=document.getElementById('pub-desc').value.trim();
+  const min=parseFloat(document.getElementById('pub-min').value);
+  const max=parseFloat(document.getElementById('pub-max').value);
+  const modal=document.getElementById('pub-modal').value;
+  const plazo=document.getElementById('pub-plazo').value;
+  const tagsRaw=document.getElementById('pub-tags').value.trim();
+  const errPub=msg=>{ const el=document.getElementById('pub-err'); el.textContent=msg; el.style.display='block'; el.scrollIntoView({behavior:'smooth',block:'center'}); setTimeout(()=>el.style.display='none',5000); };
+  if(!titulo||titulo.length<10) return errPub('El título debe tener mínimo 10 caracteres');
+  if(!cat)                       return errPub('Selecciona una categoría');
+  if(!desc||desc.length<50)      return errPub('La descripción debe tener mínimo 50 caracteres');
+  if(!min||min<1)                return errPub('Escribe el presupuesto mínimo');
+  if(!max||max<min)              return errPub('El presupuesto máximo debe ser mayor al mínimo');
+  if(!modal)                     return errPub('Selecciona la modalidad de pago');
+  if(!plazo)                     return errPub('Selecciona el plazo de entrega');
+  const tags=tagsRaw?tagsRaw.split(',').map(t=>t.trim()).filter(t=>t).slice(0,8):[];
+  const btn=document.getElementById('btn-publicar'); btn.disabled=true; btn.textContent='Publicando...';
+  try {
+    await addDoc(collection(db,'projects'),{
+      titulo, cat,
+      desc: desc.length>200 ? desc.substring(0,200)+'...' : desc,
+      descLarga: desc,
+      presupMin:min, presupMax:max, modalidad:modal, plazo_entrega:plazo, tags,
+      estado:'activo', propuestas:0,
+      clienteId:usuarioActual.uid,
+      clienteNombre:datosUsuario.nombre||usuarioActual.displayName||usuarioActual.email,
+      clienteEmail:usuarioActual.email,
+      clienteColor:colorHash(datosUsuario.nombre||'C'),
+      createdAt:serverTimestamp()
+    });
+    mostrarToast('¡Proyecto publicado exitosamente! Ya es visible para todos los freelancers.','ok');
+    setTimeout(()=>{ mostrarPagina('proyectos'); cargarProyectos(); },1500);
+  } catch(e){ btn.disabled=false; btn.textContent='Publicar proyecto'; errPub('Error al publicar. Verifica tu conexión.'); }
+};
+
+// ── Dashboard ───────────────────────────────────────────
+window.abrirDashboard = async () => {
+  if(!usuarioActual){ abrirAuth('login'); return; }
+  mostrarPagina('dashboard');
+  const nombre  = datosUsuario.nombre||usuarioActual.displayName||usuarioActual.email.split('@')[0];
+  const rol     = datosUsuario.rol||'freelancer';
+  const esCliente= rol==='client';
+  document.getElementById('pag-dashboard').innerHTML=renderDashLoading(nombre,rol);
+  esCliente ? await dashCliente(nombre) : await dashFreelancer(nombre);
+};
+
+async function dashFreelancer(nombre) {
+  let props=[];
+  try { const q=query(collection(db,'proposals'),where('freelancerId','==',usuarioActual.uid)); const s=await getDocs(q); props=s.docs.map(d=>({id:d.id,...d.data()})); } catch(e){}
+  const ganado=props.filter(p=>p.estado==='aceptada').reduce((s,p)=>s+(p.precio||0),0);
+  document.getElementById('pag-dashboard').innerHTML=`
+    <div class="dash-wrap">
+      ${renderDashHead(nombre,'freelancer')}
+      <div class="kpi-grid">
+        <div class="kpi-card"><div class="kpi-label">Propuestas enviadas</div><div class="kpi-val">${props.length}</div><div class="kpi-sub">${props.filter(p=>p.estado==='pendiente').length} en revisión</div></div>
+        <div class="kpi-card"><div class="kpi-label">Aceptadas</div><div class="kpi-val" style="color:var(--verde)">${props.filter(p=>p.estado==='aceptada').length}</div><div class="kpi-sub">proyectos ganados</div></div>
+        <div class="kpi-card"><div class="kpi-label">Ganado total</div><div class="kpi-val" style="color:var(--azul)">$${ganado.toLocaleString()}</div><div class="kpi-sub">USD sin descuentos</div></div>
+        <div class="kpi-card"><div class="kpi-label">Tu comisión</div><div class="kpi-val" style="color:var(--verde)">$0</div><div class="kpi-sub">Freelko no te cobra</div></div>
+      </div>
+      <div class="dash-section">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <h2>Mis propuestas</h2>
+          <button class="btn-azul" onclick="mostrarPagina('proyectos');cargarProyectos()">Buscar proyectos →</button>
+        </div>
+        ${props.length===0?`<div class="empty-state"><div style="font-size:1.8rem;margin-bottom:10px">📋</div><p>Aún no has enviado propuestas.</p><button class="btn-azul" style="margin-top:14px" onclick="mostrarPagina('proyectos');cargarProyectos()">Ver proyectos disponibles →</button></div>`:
+          props.map(p=>`<div class="prop-row"><div class="prop-info"><div class="prop-titulo">${p.projectId||'Proyecto'}</div><div class="prop-meta">$${(p.precio||0).toLocaleString()} USD · ${p.plazo||''}</div></div><span class="estado-badge estado-${p.estado||'pendiente'}">${p.estado==='aceptada'?'✓ Aceptada':p.estado==='rechazada'?'✗ Rechazada':'⏳ En revisión'}</span></div>`).join('')}
+      </div>
+      <div class="dash-section">
+        <h2>Acciones</h2>
+        <div class="acciones-grid">
+          <button class="accion-btn" onclick="mostrarPagina('proyectos');cargarProyectos()"><span>🔍</span><span>Buscar proyectos</span></button>
+          <button class="accion-btn" onclick="mostrarToast('Próximamente: editar tu perfil público','info')"><span>👤</span><span>Mi perfil</span></button>
+          <button class="accion-btn" onclick="mostrarToast('Próximamente: mensajes directos','info')"><span>💬</span><span>Mensajes</span></button>
+          <button class="accion-btn" onclick="mostrarToast('Próximamente: configurar pagos','info')"><span>💳</span><span>Pagos</span></button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function dashCliente(nombre) {
+  let proyectos=[];
+  try { const q=query(collection(db,'projects'),where('clienteId','==',usuarioActual.uid)); const s=await getDocs(q); proyectos=s.docs.map(d=>({id:d.id,...d.data()})); } catch(e){}
+  const totalProp=proyectos.reduce((s,p)=>s+(p.propuestas||0),0);
+  document.getElementById('pag-dashboard').innerHTML=`
+    <div class="dash-wrap">
+      ${renderDashHead(nombre,'client')}
+      <div style="margin-bottom:24px">
+        <button class="btn-azul" onclick="mostrarFormProyecto()">+ Publicar nuevo proyecto</button>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi-card"><div class="kpi-label">Proyectos publicados</div><div class="kpi-val">${proyectos.length}</div><div class="kpi-sub">${proyectos.filter(p=>p.estado==='activo').length} activos</div></div>
+        <div class="kpi-card"><div class="kpi-label">Propuestas recibidas</div><div class="kpi-val" style="color:var(--azul)">${totalProp}</div><div class="kpi-sub">en total</div></div>
+        <div class="kpi-card"><div class="kpi-label">Comisión que pagas</div><div class="kpi-val">8%</div><div class="kpi-sub">solo al contratar</div></div>
+        <div class="kpi-card"><div class="kpi-label">Freelancers</div><div class="kpi-val">Beta</div><div class="kpi-sub">usuarios reales</div></div>
+      </div>
+      <div class="dash-section">
+        <h2>Mis proyectos publicados</h2>
+        ${proyectos.length===0?`<div class="empty-state"><div style="font-size:1.8rem;margin-bottom:10px">📝</div><p>Aún no has publicado proyectos.</p><button class="btn-azul" style="margin-top:14px" onclick="mostrarFormProyecto()">Publicar mi primer proyecto →</button></div>`:
+          proyectos.map(p=>`
+            <div class="prop-row" onclick="verProyecto('${p.id}')" style="cursor:pointer">
+              <div class="prop-info">
+                <div class="prop-titulo">${p.titulo}</div>
+                <div class="prop-meta">$${Number(p.presupMin||0).toLocaleString()}–$${Number(p.presupMax||0).toLocaleString()} USD · <strong>${p.propuestas||0} propuestas</strong></div>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px">
+                <span class="estado-badge ${p.estado==='activo'?'estado-aceptada':'estado-pendiente'}">${p.estado==='activo'?'✓ Activo':'⏸ Pausado'}</span>
+                <button class="btn-ver-proyecto" onclick="event.stopPropagation();verProyecto('${p.id}')">Ver →</button>
+              </div>
+            </div>`).join('')}
+      </div>
+      <div class="dash-section">
+        <h2>Acciones</h2>
+        <div class="acciones-grid">
+          <button class="accion-btn" onclick="mostrarFormProyecto()"><span>➕</span><span>Publicar proyecto</span></button>
+          <button class="accion-btn" onclick="mostrarPagina('proyectos');cargarProyectos()"><span>🔍</span><span>Ver proyectos</span></button>
+          <button class="accion-btn" onclick="mostrarToast('Próximamente: mensajes','info')"><span>💬</span><span>Mensajes</span></button>
+          <button class="accion-btn" onclick="mostrarToast('Próximamente: pagos','info')"><span>💳</span><span>Mis pagos</span></button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderDashHead(nombre, rol) {
+  const esC=rol==='client';
+  return `<div class="dash-header">
+    <div class="dash-user">
+      <div class="dash-avatar">${nombre[0].toUpperCase()}</div>
+      <div><h1>Hola, ${nombre.split(' ')[0]} 👋</h1>
+      <p style="font-size:.85rem;color:var(--muted)">${usuarioActual.email} · <span class="badge-rol-inline ${rol}">${esC?'🏢 Cliente':'💼 Freelancer'}</span></p></div>
+    </div>
+    <button class="btn-ghost" onclick="logout()">Cerrar sesión</button>
+  </div>`;
+}
+function renderDashLoading(nombre,rol){return`<div class="dash-wrap">${renderDashHead(nombre,rol)}<div class="cargando"><div class="spinner"></div><p>Cargando...</p></div></div>`;}
+
+// ── NAV actualización ───────────────────────────────────
+function actualizarNav(user, d) {
+  const nu=document.getElementById('nav-user');
+  const bl=document.getElementById('btn-login-nav');
+  const br=document.getElementById('btn-reg-nav');
+  const bc=document.getElementById('nav-contrata');
+  if(user){
+    const av=document.getElementById('nav-av');
+    if(user.photoURL) av.innerHTML=`<img src="${user.photoURL}" style="width:32px;height:32px;border-radius:50%;object-fit:cover">`;
+    else av.textContent=(d.nombre||user.email)[0].toUpperCase();
+    document.getElementById('nav-nombre').textContent=(d.nombre||user.displayName||user.email).split(' ')[0];
+    nu.style.display='flex'; bl.style.display='none'; br.style.display='none';
+    if(bc) bc.style.display = d.rol==='client'?'block':'none';
+    // Actualizar menú de perfil
+    document.getElementById('menu-rol-label').textContent = d.rol==='client'?'🏢 Cliente':'💼 Freelancer';
+    document.getElementById('menu-buscar-trabajo').style.display = d.rol!=='client'?'block':'none';
+    document.getElementById('menu-buscar-proyectos').style.display = d.rol!=='client'?'block':'none';
+    document.getElementById('menu-publicar-proyecto').style.display = d.rol==='client'?'block':'none';
+    document.getElementById('menu-mis-proyectos').style.display = d.rol==='client'?'block':'none';
+  } else {
+    nu.style.display='none'; bl.style.display='block'; br.style.display='block';
+    if(bc) bc.style.display='none';
+  }
+}
+
+// ── Menús desplegables ──────────────────────────────────
+window.toggleMenuPerfil = e => {
+  e.stopPropagation();
+  const m=document.getElementById('menu-perfil');
+  m.style.display = m.style.display==='block'?'none':'block';
+  document.getElementById('menu-contrata-dd').style.display='none';
+};
+window.toggleMenuContrata = e => {
+  e.stopPropagation();
+  const m=document.getElementById('menu-contrata-dd');
+  m.style.display = m.style.display==='block'?'none':'block';
+  document.getElementById('menu-perfil').style.display='none';
+};
+window.cerrarMenus = () => {
+  document.getElementById('menu-perfil').style.display='none';
+  document.getElementById('menu-contrata-dd').style.display='none';
+};
+document.addEventListener('click', cerrarMenus);
+
+function cerrarModalAuth(){ document.getElementById('auth-overlay').style.display='none'; }
+window.abrirAuth  = tab => { document.getElementById('auth-overlay').style.display='flex'; switchTab(tab||'reg'); };
+window.cerrarAuth = e  => { if(e.target.id==='auth-overlay') cerrarModalAuth(); };
+window.switchTab  = t  => {
+  document.getElementById('tab-reg').style.display  =t==='reg'  ?'block':'none';
+  document.getElementById('tab-login').style.display=t==='login'?'block':'none';
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('activo'));
+  document.getElementById('btn-'+t).classList.add('activo');
+  document.getElementById('err').style.display='none';
+};
+window.selRol = r => {
+  document.querySelectorAll('.rol-btn').forEach(b=>b.classList.remove('activo'));
+  document.querySelectorAll('[data-rol="'+r+'"]').forEach(b=>b.classList.add('activo'));
+};
+window.filtrarCategoria = cat => {
+  document.querySelectorAll('.cat-chip').forEach(c=>c.classList.remove('activo'));
+  event.target.classList.add('activo');
+  cargarProyectos(cat);
+};
+
+// ── Toast ───────────────────────────────────────────────
+window.mostrarToast = (msg, tipo='ok') => {
+  const t=document.getElementById('toast');
+  t.textContent=msg;
+  t.className='toast toast-'+tipo+' show';
+  setTimeout(()=>t.classList.remove('show'),3500);
+};
+
+function mostrarError(msg){ const el=document.getElementById('err'); el.textContent=msg; el.style.display='block'; setTimeout(()=>el.style.display='none',4000); }
+function setBusy(s){ document.querySelectorAll('.btn-primary,.btn-google-auth').forEach(b=>{b.disabled=s;b.style.opacity=s?.6:1;}); }
+function tradError(code){ return({'auth/email-already-in-use':'Este correo ya tiene cuenta. Inicia sesión.','auth/invalid-email':'Correo inválido.','auth/weak-password':'Contraseña muy débil.','auth/wrong-password':'Contraseña incorrecta.','auth/user-not-found':'No existe cuenta con este correo.','auth/invalid-credential':'Correo o contraseña incorrectos.','auth/too-many-requests':'Demasiados intentos. Espera unos minutos.'})[code]||'Error: '+code; }
+function tiempoAtras(date){ if(!date) return 'reciente'; const s=Math.floor((new Date()-date)/1000); if(s<60) return 'hace un momento'; if(s<3600) return `hace ${Math.floor(s/60)} min`; if(s<86400) return `hace ${Math.floor(s/3600)}h`; return `hace ${Math.floor(s/86400)} día${Math.floor(s/86400)>1?'s':''}`; }
+function colorHash(str){ const c=['#6366f1','#059669','#0891b2','#dc2626','#7c3aed','#d97706','#0284c7','#be185d']; let h=0; for(let x of str||'A') h=x.charCodeAt(0)+h*31; return c[Math.abs(h)%c.length]; }
+
+window.addEventListener('load', ()=>cargarProyectos());
+</script>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--azul:#1a56db;--azul-hover:#1648c0;--verde:#057a55;--texto:#111928;--muted:#6b7280;--borde:#e5e7eb;--bg:#f9fafb;--blanco:#ffffff;--radio:10px;--sombra:0 1px 3px rgba(0,0,0,.08);--sombra-md:0 4px 12px rgba(0,0,0,.1);}
+body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--blanco);color:var(--texto);font-size:15px;line-height:1.6}
+button{cursor:pointer;font-family:inherit}
+
+/* ── NAV ── */
+nav{position:sticky;top:0;z-index:200;background:var(--blanco);border-bottom:1px solid var(--borde);padding:0 40px;height:64px;display:flex;align-items:center;justify-content:space-between;}
+.logo{font-size:1.35rem;font-weight:800;color:var(--azul);letter-spacing:-.5px;cursor:pointer}
+.logo span{color:var(--texto)}
+.nav-centro{display:flex;align-items:center;gap:4px}
+.nav-link{font-size:.9rem;color:var(--muted);font-weight:500;cursor:pointer;padding:8px 14px;border-radius:8px;transition:all .15s;border:none;background:none;font-family:inherit;display:flex;align-items:center;gap:4px}
+.nav-link:hover{color:var(--texto);background:var(--bg)}
+.nav-link.active-link{color:var(--azul);font-weight:600}
+.nav-derecha{display:flex;align-items:center;gap:10px;position:relative}
+.btn-ghost{background:none;border:1px solid var(--borde);color:var(--texto);padding:8px 18px;border-radius:var(--radio);font-size:.88rem;font-weight:600;transition:all .15s}
+.btn-ghost:hover{border-color:#9ca3af;background:var(--bg)}
+.btn-azul{background:var(--azul);color:#fff;padding:8px 20px;border-radius:var(--radio);font-size:.88rem;font-weight:600;border:none;transition:background .15s}
+.btn-azul:hover{background:var(--azul-hover)}
+#nav-user{display:none;align-items:center;gap:10px}
+.nav-perfil-btn{display:flex;align-items:center;gap:8px;background:none;border:1px solid var(--borde);border-radius:50px;padding:5px 12px 5px 5px;cursor:pointer;transition:all .15s;font-family:inherit}
+.nav-perfil-btn:hover{border-color:#9ca3af;background:var(--bg)}
+.nav-av{width:32px;height:32px;border-radius:50%;background:var(--azul);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.85rem;overflow:hidden;flex-shrink:0}
+.nav-nombre{font-size:.85rem;font-weight:600}
+.nav-chevron{font-size:.7rem;color:var(--muted)}
+
+/* ── MENÚ DESPLEGABLE PERFIL ── */
+.dropdown-wrap{position:relative}
+.dropdown-menu{position:absolute;top:calc(100%+8px);right:0;background:var(--blanco);border:1px solid var(--borde);border-radius:12px;box-shadow:var(--sombra-md);min-width:220px;display:none;overflow:hidden;z-index:300}
+.dropdown-header{padding:14px 16px;border-bottom:1px solid var(--borde);background:var(--bg)}
+.dropdown-nombre{font-weight:700;font-size:.92rem}
+.dropdown-email{font-size:.75rem;color:var(--muted);margin-top:2px}
+.dropdown-rol{display:inline-block;font-size:.72rem;font-weight:600;padding:2px 8px;border-radius:50px;margin-top:4px;background:#eff6ff;color:var(--azul)}
+.dropdown-section{padding:6px 0;border-bottom:1px solid var(--borde)}
+.dropdown-section:last-child{border-bottom:none}
+.dropdown-label{font-size:.7rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;padding:8px 16px 4px}
+.dropdown-item{display:flex;align-items:center;gap:10px;padding:9px 16px;font-size:.88rem;color:var(--texto);cursor:pointer;transition:background .15s;border:none;background:none;font-family:inherit;width:100%;text-align:left}
+.dropdown-item:hover{background:var(--bg)}
+.dropdown-item .di-icon{font-size:1rem;width:20px;text-align:center}
+.dropdown-item.danger{color:#dc2626}
+.dropdown-item.danger:hover{background:#fef2f2}
+
+/* ── MENÚ CONTRATA ── */
+#nav-contrata{position:relative;display:none}
+.contrata-btn{display:flex;align-items:center;gap:4px}
+.contrata-menu{position:absolute;top:calc(100%+8px);left:0;background:var(--blanco);border:1px solid var(--borde);border-radius:12px;box-shadow:var(--sombra-md);min-width:220px;display:none;overflow:hidden;z-index:300}
+.contrata-item{display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:.9rem;font-weight:500;color:var(--texto);cursor:pointer;transition:background .15s;border:none;background:none;font-family:inherit;width:100%}
+.contrata-item:hover{background:var(--bg)}
+.contrata-item .ci-icon{font-size:1.1rem;width:24px;text-align:center}
+
+/* ── TOAST ── */
+.toast{position:fixed;bottom:24px;right:24px;z-index:999;padding:12px 20px;border-radius:10px;font-size:.88rem;font-weight:500;box-shadow:0 8px 24px rgba(0,0,0,.15);transform:translateY(16px);opacity:0;transition:all .3s;pointer-events:none}
+.toast.show{transform:translateY(0);opacity:1}
+.toast-ok{background:#166534;color:#fff}
+.toast-warn{background:#92400e;color:#fff}
+.toast-info{background:#1e40af;color:#fff}
+
+/* ── PÁGINAS ── */
+.pagina{display:none}
+#pag-proyectos{display:block}
+
+/* ── HERO ── */
+.hero-busqueda{background:linear-gradient(135deg,#eff6ff 0%,#f0fdf4 100%);border-bottom:1px solid var(--borde);padding:56px 40px 40px;text-align:center;}
+.hero-busqueda h1{font-size:2.4rem;font-weight:800;letter-spacing:-1px;margin-bottom:10px}
+.hero-busqueda h1 span{color:var(--azul)}
+.hero-busqueda p{color:var(--muted);font-size:1rem;margin-bottom:28px}
+.barra-busqueda{display:flex;max-width:680px;margin:0 auto 24px;background:var(--blanco);border:1.5px solid var(--borde);border-radius:12px;overflow:hidden;box-shadow:var(--sombra-md);}
+.barra-busqueda input{flex:1;padding:14px 20px;border:none;outline:none;font-family:inherit;font-size:.95rem;color:var(--texto);}
+.barra-busqueda input::placeholder{color:#9ca3af}
+.barra-busqueda button{background:var(--azul);color:#fff;border:none;padding:14px 28px;font-size:.9rem;font-weight:600;font-family:inherit;transition:background .15s;white-space:nowrap;}
+.barra-busqueda button:hover{background:var(--azul-hover)}
+.chips-categorias{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.cat-chip{background:var(--blanco);border:1.5px solid var(--borde);color:var(--muted);padding:6px 16px;border-radius:50px;font-size:.82rem;font-weight:600;cursor:pointer;transition:all .15s;}
+.cat-chip:hover,.cat-chip.activo{background:var(--azul);border-color:var(--azul);color:#fff;}
+
+/* ── LAYOUT ── */
+.layout{display:grid;grid-template-columns:240px 1fr;gap:0;max-width:1280px;margin:0 auto;padding:32px 40px;align-items:start}
+.sidebar{background:var(--blanco);border:1px solid var(--borde);border-radius:12px;padding:20px;position:sticky;top:80px}
+.sidebar-title{font-size:.78rem;font-weight:700;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:12px}
+.filtro-grupo{margin-bottom:20px}
+.filtro-opcion{display:flex;align-items:center;gap:10px;padding:6px 0}
+.filtro-opcion input[type=checkbox]{width:16px;height:16px;accent-color:var(--azul);cursor:pointer}
+.filtro-opcion label{font-size:.87rem;color:var(--texto);cursor:pointer;flex:1}
+.filtro-opcion .cnt{font-size:.72rem;color:var(--muted);background:var(--bg);padding:2px 7px;border-radius:50px}
+.rango-precio{display:flex;gap:8px}
+.rango-precio input{width:100%;padding:8px 10px;border:1.5px solid var(--borde);border-radius:8px;font-size:.84rem;font-family:inherit;outline:none;color:var(--texto);}
+.btn-publicar-side{width:100%;background:var(--verde);color:#fff;border:none;padding:11px;border-radius:var(--radio);font-size:.88rem;font-weight:700;font-family:inherit;margin-bottom:14px;transition:background .15s;}
+.btn-publicar-side:hover{background:#065f46}
+.btn-filtrar{width:100%;background:var(--azul);color:#fff;border:none;padding:10px;border-radius:var(--radio);font-size:.87rem;font-weight:600;font-family:inherit;margin-top:10px;transition:background .15s;}
+.btn-filtrar:hover{background:var(--azul-hover)}
+
+/* ── PROYECTOS ── */
+.proyectos-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:12px}
+.proyectos-header h2{font-size:1.05rem;font-weight:700}
+.proyectos-header-right{display:flex;align-items:center;gap:12px}
+.ordenar select{border:1.5px solid var(--borde);border-radius:8px;padding:6px 10px;font-size:.84rem;font-family:inherit;background:var(--blanco);outline:none;cursor:pointer;color:var(--texto);}
+.proyectos-grid{display:flex;flex-direction:column;gap:14px}
+.proyecto-card{background:var(--blanco);border:1px solid var(--borde);border-radius:12px;padding:22px;transition:border-color .15s,box-shadow .15s;cursor:pointer;}
+.proyecto-card:hover{border-color:#93c5fd;box-shadow:0 4px 16px rgba(26,86,219,.08)}
+.card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:10px}
+.cat-badge{display:inline-block;font-size:.7rem;font-weight:700;padding:3px 10px;border-radius:50px;text-transform:uppercase;}
+.badge-dev{background:#eff6ff;color:#1d4ed8}.badge-dis{background:#fdf4ff;color:#7e22ce}.badge-mkt{background:#f0fdf4;color:#15803d}.badge-red{background:#fff7ed;color:#c2410c}.badge-vid{background:#fff1f2;color:#be123c}.badge-fin{background:#ecfdf5;color:#065f46}
+.card-titulo{font-size:.97rem;font-weight:700;margin:8px 0 5px;line-height:1.4}
+.card-desc{font-size:.85rem;color:var(--muted);line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card-presupuesto{text-align:right;flex-shrink:0}
+.presupuesto-valor{font-size:1.05rem;font-weight:800}
+.presupuesto-tipo{font-size:.72rem;color:var(--muted);margin-top:2px}
+.card-tags{display:flex;flex-wrap:wrap;gap:5px;margin:10px 0}
+.tag{background:var(--bg);border:1px solid var(--borde);color:var(--muted);padding:3px 9px;border-radius:50px;font-size:.72rem;font-weight:500}
+.card-footer{display:flex;align-items:center;justify-content:space-between;padding-top:12px;border-top:1px solid var(--borde)}
+.cliente-info{display:flex;align-items:center;gap:8px}
+.cliente-av{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.72rem;color:#fff;flex-shrink:0}
+.cliente-nombre{font-size:.8rem;font-weight:600}
+.cliente-rating{font-size:.72rem;color:var(--muted)}
+.card-meta{display:flex;align-items:center;gap:14px}
+.meta-item{font-size:.72rem;color:var(--muted)}
+.btn-ver-proyecto{background:var(--azul);color:#fff;border:none;padding:7px 16px;border-radius:8px;font-size:.8rem;font-weight:600;font-family:inherit;transition:background .15s;}
+.btn-ver-proyecto:hover{background:var(--azul-hover)}
+.banner-comision{background:linear-gradient(135deg,#eff6ff,#f0fdf4);border:1px solid #bfdbfe;border-radius:10px;padding:14px 20px;display:flex;align-items:center;gap:14px;margin-bottom:20px;}
+.banner-comision p{font-size:.85rem;line-height:1.5}
+.banner-comision strong{color:var(--azul)}
+
+/* ── EMPTY STATE ── */
+.empty-lista{text-align:center;padding:64px 20px}
+.empty-icon{font-size:3rem;margin-bottom:16px}
+.empty-lista h3{font-size:1.2rem;font-weight:700;margin-bottom:8px}
+.empty-lista p{color:var(--muted);font-size:.92rem;line-height:1.7;max-width:420px;margin:0 auto}
+.cargando{text-align:center;padding:60px 20px;color:var(--muted)}
+.spinner{width:30px;height:30px;border:3px solid var(--borde);border-top-color:var(--azul);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── DETALLE ── */
+.detalle-wrap{max-width:1200px;margin:0 auto;padding:32px 40px}
+.btn-back{background:none;border:none;color:var(--azul);font-size:.88rem;font-weight:600;font-family:inherit;cursor:pointer;padding:0;margin-bottom:20px;}
+.detalle-grid{display:grid;grid-template-columns:1fr 340px;gap:28px;align-items:start}
+.detalle-titulo{font-size:1.55rem;font-weight:800;letter-spacing:-.5px;margin:12px 0 12px;line-height:1.3}
+.detalle-meta-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px}
+.meta-chip{background:var(--bg);border:1px solid var(--borde);padding:4px 12px;border-radius:50px;font-size:.78rem;color:var(--muted);font-weight:500}
+.detalle-seccion{margin-bottom:28px;padding-bottom:28px;border-bottom:1px solid var(--borde)}
+.detalle-seccion:last-child{border-bottom:none}
+.detalle-seccion h2{font-size:.95rem;font-weight:700;margin-bottom:12px}
+.detalle-seccion p{font-size:.9rem;color:var(--muted);line-height:1.8}
+.tags-wrap{display:flex;flex-wrap:wrap;gap:7px}
+.cliente-perfil{display:flex;align-items:center;gap:14px}
+.cliente-av-lg{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.1rem;color:#fff;flex-shrink:0}
+.cliente-nombre-lg{font-size:.97rem;font-weight:700;margin-bottom:3px}
+.cliente-stats{font-size:.8rem;color:var(--muted)}
+.detalle-sidebar{position:sticky;top:80px}
+.propuesta-card{background:var(--blanco);border:1.5px solid var(--borde);border-radius:14px;padding:22px;margin-bottom:14px;box-shadow:var(--sombra-md)}
+.presupuesto-display{text-align:center;padding:18px 0 22px;border-bottom:1px solid var(--borde);margin-bottom:22px}
+.presup-label{display:block;font-size:.75rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
+.presup-valor{display:block;font-size:1.55rem;font-weight:800;margin-bottom:3px}
+.presup-nota{display:block;font-size:.73rem;color:var(--muted)}
+.form-group{margin-bottom:14px}
+.form-label{display:block;font-size:.8rem;font-weight:600;color:var(--texto);margin-bottom:5px}
+.form-input{width:100%;padding:10px 13px;border:1.5px solid var(--borde);border-radius:var(--radio);font-size:.88rem;font-family:inherit;outline:none;transition:border-color .15s;color:var(--texto);}
+.form-input:focus{border-color:var(--azul)}
+.form-textarea{width:100%;padding:10px 13px;border:1.5px solid var(--borde);border-radius:var(--radio);font-size:.86rem;font-family:inherit;outline:none;resize:vertical;transition:border-color .15s;color:var(--texto);line-height:1.6;}
+.form-textarea:focus{border-color:var(--azul)}
+.form-textarea::placeholder{color:#9ca3af}
+.btn-azul-full{width:100%;background:var(--azul);color:#fff;border:none;padding:12px;border-radius:var(--radio);font-size:.9rem;font-weight:700;font-family:inherit;transition:background .15s;}
+.btn-azul-full:hover{background:var(--azul-hover)}
+.btn-ghost-full{width:100%;background:none;border:1px solid var(--borde);color:var(--texto);padding:11px;border-radius:var(--radio);font-size:.87rem;font-weight:600;font-family:inherit;margin-top:8px;transition:all .15s}
+.btn-ghost-full:hover{border-color:#9ca3af}
+.stats-card{background:var(--bg);border:1px solid var(--borde);border-radius:12px;padding:16px}
+.stat-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:.83rem;border-bottom:1px solid var(--borde)}
+.stat-row:last-child{border-bottom:none}
+.stat-row span{color:var(--muted)}
+
+/* ── FORMULARIO PUBLICAR ── */
+.publicar-wrap{max-width:740px;margin:0 auto;padding:36px 40px}
+.publicar-wrap h1{font-size:1.7rem;font-weight:800;letter-spacing:-.5px;margin-bottom:5px}
+.subtitulo{color:var(--muted);font-size:.9rem;margin-bottom:28px}
+.pub-card{background:var(--blanco);border:1px solid var(--borde);border-radius:12px;padding:24px;margin-bottom:16px}
+.pub-card h2{font-size:.95rem;font-weight:700;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--borde)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.char-count{font-size:.72rem;color:var(--muted);text-align:right;margin-top:3px}
+#pub-err{display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:11px 15px;border-radius:8px;font-size:.84rem;margin-bottom:14px}
+.preview-precio-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px;margin-top:10px;font-size:.83rem;color:var(--muted);line-height:1.8}
+.btn-pub-final{background:var(--azul);color:#fff;border:none;padding:13px 40px;border-radius:var(--radio);font-size:.97rem;font-weight:700;font-family:inherit;transition:background .15s;}
+.btn-pub-final:hover{background:var(--azul-hover)}
+
+/* ── DASHBOARD ── */
+.dash-wrap{max-width:1080px;margin:0 auto;padding:32px 40px}
+.dash-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;padding-bottom:22px;border-bottom:1px solid var(--borde);flex-wrap:wrap;gap:14px}
+.dash-user{display:flex;align-items:center;gap:14px}
+.dash-avatar{width:52px;height:52px;border-radius:50%;background:var(--azul);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.2rem;flex-shrink:0}
+.dash-user h1{font-size:1.4rem;font-weight:800;margin-bottom:3px}
+.badge-rol-inline{padding:2px 9px;border-radius:50px;font-size:.72rem;font-weight:600}
+.badge-rol-inline.freelancer{background:#eff6ff;color:#1d4ed8}
+.badge-rol-inline.client{background:#f0fdf4;color:#15803d}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:28px}
+.kpi-card{background:var(--blanco);border:1px solid var(--borde);border-radius:12px;padding:18px}
+.kpi-label{font-size:.72rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.kpi-val{font-size:1.8rem;font-weight:800;margin-bottom:3px}
+.kpi-sub{font-size:.72rem;color:var(--muted)}
+.dash-section{margin-bottom:28px}
+.dash-section h2{font-size:1.05rem;font-weight:700;margin-bottom:14px}
+.empty-state{text-align:center;padding:36px 20px;background:var(--bg);border-radius:12px;color:var(--muted);font-size:.9rem}
+.prop-row{display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--borde);border-radius:10px;margin-bottom:8px;gap:14px}
+.prop-titulo{font-size:.88rem;font-weight:600;margin-bottom:3px}
+.prop-meta{font-size:.78rem;color:var(--muted)}
+.estado-badge{padding:4px 11px;border-radius:50px;font-size:.72rem;font-weight:700;white-space:nowrap}
+.estado-pendiente{background:#fef9c3;color:#854d0e}
+.estado-aceptada{background:#dcfce7;color:#166534}
+.estado-rechazada{background:#fee2e2;color:#991b1b}
+.acciones-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.accion-btn{background:var(--blanco);border:1.5px solid var(--borde);border-radius:10px;padding:18px 14px;display:flex;flex-direction:column;align-items:center;gap:7px;font-size:.83rem;font-weight:600;transition:all .15s}
+.accion-btn span:first-child{font-size:1.3rem}
+.accion-btn:hover{border-color:var(--azul);color:var(--azul);background:#eff6ff}
+
+/* ── MODAL AUTH ── */
+#auth-overlay{display:none;position:fixed;inset:0;z-index:400;background:rgba(17,25,40,.5);align-items:center;justify-content:center;padding:20px;}
+.auth-modal{background:var(--blanco);border-radius:16px;width:100%;max-width:420px;overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,.18);}
+.auth-header{padding:26px 28px 0;display:flex;justify-content:space-between;align-items:center;}
+.auth-header h2{font-size:1.25rem;font-weight:800}
+.btn-cerrar-modal{background:none;border:none;font-size:1.3rem;color:var(--muted);padding:4px 8px;border-radius:6px}
+.auth-tabs-modal{display:flex;padding:18px 28px 0;border-bottom:1px solid var(--borde)}
+.tab-btn{flex:1;padding:9px 0;border:none;background:none;font-size:.88rem;font-weight:600;color:var(--muted);border-bottom:2.5px solid transparent;margin-bottom:-1px;font-family:inherit;transition:all .15s;}
+.tab-btn.activo{color:var(--azul);border-bottom-color:var(--azul)}
+.auth-body{padding:22px 28px 28px}
+.rol-selector{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}
+.rol-btn{border:1.5px solid var(--borde);background:var(--blanco);padding:11px;border-radius:var(--radio);text-align:center;font-size:.83rem;font-weight:600;color:var(--muted);transition:all .15s;font-family:inherit;}
+.rol-btn .rol-icono{font-size:1.2rem;display:block;margin-bottom:3px}
+.rol-btn.activo{border-color:var(--azul);background:#eff6ff;color:var(--azul)}
+.btn-primary{width:100%;background:var(--azul);color:#fff;border:none;padding:11px;border-radius:var(--radio);font-size:.9rem;font-weight:700;font-family:inherit;transition:background .15s;}
+.btn-primary:hover{background:var(--azul-hover)}
+.divider-auth{display:flex;align-items:center;gap:10px;margin:14px 0;color:var(--muted);font-size:.78rem}
+.divider-auth::before,.divider-auth::after{content:'';flex:1;height:1px;background:var(--borde)}
+.btn-google-auth{width:100%;background:var(--blanco);border:1.5px solid var(--borde);padding:10px;border-radius:var(--radio);font-size:.86rem;font-weight:600;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:9px;transition:all .15s;}
+.btn-google-auth:hover{border-color:#9ca3af;background:var(--bg)}
+#err{display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:9px 13px;border-radius:8px;font-size:.8rem;margin-bottom:12px}
+.auth-nota{text-align:center;font-size:.72rem;color:var(--muted);margin-top:12px}
+
+@media(max-width:900px){
+  .layout{grid-template-columns:1fr;padding:20px}.sidebar{display:none}
+  .hero-busqueda{padding:36px 20px 24px}.hero-busqueda h1{font-size:1.7rem}
+  nav{padding:0 16px}.nav-centro{display:none}
+  .detalle-grid{grid-template-columns:1fr}.detalle-wrap,.publicar-wrap,.dash-wrap{padding:20px}
+  .kpi-grid{grid-template-columns:1fr 1fr}.acciones-grid{grid-template-columns:1fr 1fr}
+  .form-row{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- ── NAV ─────────────────────────────────────────────── -->
+<nav>
+  <div style="display:flex;align-items:center;gap:32px">
+    <div class="logo" onclick="mostrarPagina('proyectos');cargarProyectos()">free<span>lko</span></div>
+    <div class="nav-centro">
+      <button class="nav-link" onclick="mostrarPagina('proyectos');cargarProyectos()">Proyectos</button>
+      <button class="nav-link">Freelancers</button>
+      <!-- Menú Contrata (solo clientes) -->
+      <div id="nav-contrata" class="dropdown-wrap">
+        <button class="nav-link contrata-btn" onclick="toggleMenuContrata(event)">
+          Contrata <span class="nav-chevron">▾</span>
+        </button>
+        <div id="menu-contrata-dd" class="contrata-menu">
+          <button class="contrata-item" onclick="mostrarFormProyecto()"><span class="ci-icon">📋</span>Publicar un proyecto</button>
+          <button class="contrata-item" onclick="mostrarPagina('proyectos');cargarProyectos()"><span class="ci-icon">🔍</span>Encuentra freelancers</button>
+          <button class="contrata-item" onclick="mostrarToast('Próximamente: listas de talento','info')"><span class="ci-icon">⭐</span>Listas de talento</button>
+        </div>
+      </div>
+      <button class="nav-link" onclick="mostrarToast('Próximamente: cómo funciona Freelko','info')">Cómo funciona</button>
+    </div>
+  </div>
+
+  <div class="nav-derecha">
+    <!-- Usuario autenticado -->
+    <div id="nav-user">
+      <!-- Botón publicar (solo freelancer lo ve diferente) -->
+      <button class="btn-azul" style="background:var(--verde);display:none" id="btn-pub-quick" onclick="mostrarFormProyecto()">+ Publicar</button>
+      <!-- Perfil con menú desplegable -->
+      <div class="dropdown-wrap">
+        <button class="nav-perfil-btn" onclick="toggleMenuPerfil(event)">
+          <div class="nav-av" id="nav-av">?</div>
+          <span class="nav-nombre" id="nav-nombre"></span>
+          <span class="nav-chevron">▾</span>
+        </button>
+        <div id="menu-perfil" class="dropdown-menu">
+          <div class="dropdown-header">
+            <div class="dropdown-nombre" id="dp-nombre">—</div>
+            <div class="dropdown-email" id="dp-email">—</div>
+            <span class="dropdown-rol" id="menu-rol-label">—</span>
+          </div>
+
+          <!-- Sección freelancer -->
+          <div class="dropdown-section" id="menu-buscar-trabajo">
+            <div class="dropdown-label">Busca trabajo</div>
+            <button class="dropdown-item" onclick="mostrarPagina('proyectos');cargarProyectos()"><span class="di-icon">🔍</span>Busca proyectos</button>
+            <button class="dropdown-item" onclick="mostrarToast('Próximamente: perfil público','info')"><span class="di-icon">👤</span>Mi perfil público</button>
+          </div>
+
+          <!-- Sección cliente -->
+          <div class="dropdown-section" id="menu-publicar-proyecto" style="display:none">
+            <div class="dropdown-label">Contrata</div>
+            <button class="dropdown-item" onclick="mostrarFormProyecto()"><span class="di-icon">➕</span>Publicar proyecto</button>
+            <button class="dropdown-item" onclick="mostrarPagina('proyectos');cargarProyectos()"><span class="di-icon">🔍</span>Encuentra freelancers</button>
+          </div>
+
+          <div class="dropdown-section">
+            <div class="dropdown-label">Mi cuenta</div>
+            <button class="dropdown-item" onclick="abrirDashboard()"><span class="di-icon">📊</span>Mi dashboard</button>
+            <button class="dropdown-item" id="menu-mis-proyectos" style="display:none" onclick="abrirDashboard()"><span class="di-icon">📋</span>Mis proyectos</button>
+            <button class="dropdown-item" id="menu-buscar-proyectos" onclick="abrirDashboard()"><span class="di-icon">📄</span>Mis propuestas</button>
+            <button class="dropdown-item" onclick="mostrarToast('Próximamente: mensajes','info')"><span class="di-icon">💬</span>Mensajes</button>
+            <button class="dropdown-item" onclick="mostrarToast('Próximamente: finanzas','info')"><span class="di-icon">💰</span>Mis finanzas</button>
+          </div>
+
+          <div class="dropdown-section">
+            <button class="dropdown-item danger" onclick="logout()"><span class="di-icon">🚪</span>Cerrar sesión</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sin sesión -->
+    <button class="btn-ghost" id="btn-login-nav" onclick="abrirAuth('login')">Iniciar sesión</button>
+    <button class="btn-azul"  id="btn-reg-nav"   onclick="abrirAuth('reg')">Únete gratis</button>
+  </div>
+</nav>
+
+<!-- ════════════════════════════
+     PÁGINA: PROYECTOS
+════════════════════════════ -->
+<div class="pagina" id="pag-proyectos">
+  <div class="hero-busqueda">
+    <h1>Encuentra proyectos que<br><span>pagan lo que mereces</span></h1>
+    <p>0% de comisión al freelancer. El cliente paga el 8% extra. Tú cobras el 100% de tu propuesta.</p>
+    <div class="barra-busqueda">
+      <input type="text" placeholder="Busca por habilidad, tecnología o tipo de proyecto...">
+      <button>Buscar proyectos</button>
+    </div>
+    <div class="chips-categorias">
+      <button class="cat-chip activo" onclick="filtrarCategoria('todos')">Todos</button>
+      <button class="cat-chip" onclick="filtrarCategoria('dev')">💻 Desarrollo</button>
+      <button class="cat-chip" onclick="filtrarCategoria('dis')">🎨 Diseño</button>
+      <button class="cat-chip" onclick="filtrarCategoria('mkt')">📣 Marketing</button>
+      <button class="cat-chip" onclick="filtrarCategoria('red')">✍️ Redacción</button>
+      <button class="cat-chip" onclick="filtrarCategoria('vid')">🎬 Video</button>
+      <button class="cat-chip" onclick="filtrarCategoria('fin')">💼 Negocios</button>
+    </div>
+  </div>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <button class="btn-publicar-side" onclick="mostrarFormProyecto()">+ Publicar un proyecto</button>
+      <div class="filtro-grupo">
+        <div class="sidebar-title">Modalidad</div>
+        <div class="filtro-opcion"><input type="checkbox" id="f1" checked><label for="f1">Por proyecto</label></div>
+        <div class="filtro-opcion"><input type="checkbox" id="f2"><label for="f2">Tiempo completo</label></div>
+        <div class="filtro-opcion"><input type="checkbox" id="f3"><label for="f3">Mensual</label></div>
+      </div>
+      <div class="filtro-grupo">
+        <div class="sidebar-title">Presupuesto (USD)</div>
+        <div class="rango-precio"><input type="number" placeholder="Mín"><input type="number" placeholder="Máx"></div>
+      </div>
+      <div class="filtro-grupo">
+        <div class="sidebar-title">Duración</div>
+        <div class="filtro-opcion"><input type="checkbox" id="d1"><label for="d1">Menos de 1 semana</label></div>
+        <div class="filtro-opcion"><input type="checkbox" id="d2" checked><label for="d2">1 a 4 semanas</label></div>
+        <div class="filtro-opcion"><input type="checkbox" id="d3"><label for="d3">1 a 3 meses</label></div>
+        <div class="filtro-opcion"><input type="checkbox" id="d4"><label for="d4">Más de 3 meses</label></div>
+      </div>
+      <button class="btn-filtrar">Aplicar filtros</button>
+    </aside>
+
+    <div>
+      <div class="banner-comision">
+        <span style="font-size:1.3rem">💡</span>
+        <p><strong>En Freelko cobras el 100% de lo que cotizas.</strong> El 8% lo paga el cliente. Si cotizas $500 USD, recibes $500 USD.</p>
+      </div>
+      <div class="proyectos-header">
+        <div><h2>Proyectos disponibles</h2><span id="cont-proyectos" style="font-size:.83rem;color:var(--muted)">Cargando...</span></div>
+        <div class="proyectos-header-right">
+          <select class="ordenar" style="border:1.5px solid var(--borde);border-radius:8px;padding:6px 10px;font-size:.84rem;font-family:inherit;background:var(--blanco);outline:none;cursor:pointer;color:var(--texto);">
+            <option>Más recientes</option><option>Mayor presupuesto</option><option>Menos propuestas</option>
+          </select>
+        </div>
+      </div>
+      <div class="proyectos-grid" id="lista-proyectos">
+        <div class="cargando"><div class="spinner"></div><p>Cargando proyectos...</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════
+     PÁGINA: DETALLE
+════════════════════════════ -->
+<div class="pagina" id="pag-detalle"></div>
+
+<!-- ════════════════════════════
+     PÁGINA: PUBLICAR
+════════════════════════════ -->
+<div class="pagina" id="pag-publicar">
+  <div class="publicar-wrap">
+    <button class="btn-back" onclick="mostrarPagina('proyectos')">← Volver</button>
+    <h1>Publicar un proyecto</h1>
+    <p class="subtitulo">Describe lo que necesitas y recibe propuestas de freelancers calificados. Publicar es gratis.</p>
+    <div id="pub-err"></div>
+    <div class="pub-card">
+      <h2>📋 Información básica</h2>
+      <div class="form-group">
+        <label class="form-label">Título del proyecto <span style="color:#ef4444">*</span></label>
+        <input type="text" id="pub-titulo" class="form-input" placeholder="Ej: Necesito desarrollador React para app de inventarios" maxlength="120"
+          oninput="document.getElementById('tc1').textContent=this.value.length+'/120'">
+        <p id="tc1" class="char-count">0/120</p>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Categoría <span style="color:#ef4444">*</span></label>
+          <select id="pub-cat" class="form-input">
+            <option value="">Selecciona...</option>
+            <option value="dev">💻 Desarrollo & Tech</option>
+            <option value="dis">🎨 Diseño & Creatividad</option>
+            <option value="mkt">📣 Marketing Digital</option>
+            <option value="red">✍️ Redacción & Traducción</option>
+            <option value="vid">🎬 Video & Animación</option>
+            <option value="fin">💼 Finanzas & Negocios</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Modalidad <span style="color:#ef4444">*</span></label>
+          <select id="pub-modal" class="form-input">
+            <option value="">Selecciona...</option>
+            <option value="Precio fijo">Precio fijo</option>
+            <option value="Por hora">Por hora</option>
+            <option value="Mensual">Mensual (retención)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="pub-card">
+      <h2>📝 Descripción detallada</h2>
+      <div class="form-group">
+        <label class="form-label">Describe el proyecto <span style="color:#ef4444">*</span></label>
+        <textarea id="pub-desc" class="form-textarea" rows="8"
+          placeholder="Explica qué necesitas:&#10;• Qué problema quieres resolver&#10;• Resultado esperado&#10;• Requisitos técnicos o de estilo&#10;• Materiales disponibles (diseños, docs, referencias)&#10;• Cualquier detalle relevante"
+          oninput="var n=this.value.length;var el=document.getElementById('dc1');el.textContent=n+' (mín. 50)';el.style.color=n>=50?'#16a34a':'#9ca3af'"></textarea>
+        <p id="dc1" class="char-count">0 (mín. 50)</p>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Habilidades o tecnologías requeridas <span style="color:var(--muted);font-weight:400">(opcional)</span></label>
+        <input type="text" id="pub-tags" class="form-input" placeholder="Ej: React, Figma, Python, SEO (separadas por comas)">
+        <p style="font-size:.72rem;color:var(--muted);margin-top:3px">Hasta 8 habilidades separadas por comas</p>
+      </div>
+    </div>
+
+    <div class="pub-card">
+      <h2>💰 Presupuesto y plazo</h2>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Presupuesto mínimo (USD) <span style="color:#ef4444">*</span></label>
+          <div style="position:relative;display:flex;align-items:center">
+            <span style="position:absolute;left:13px;color:var(--muted);font-weight:600;font-size:.9rem">$</span>
+            <input type="number" id="pub-min" class="form-input" style="padding-left:26px" placeholder="100" min="1" oninput="actualizarPrevio()">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Presupuesto máximo (USD) <span style="color:#ef4444">*</span></label>
+          <div style="position:relative;display:flex;align-items:center">
+            <span style="position:absolute;left:13px;color:var(--muted);font-weight:600;font-size:.9rem">$</span>
+            <input type="number" id="pub-max" class="form-input" style="padding-left:26px" placeholder="500" min="1" oninput="actualizarPrevio()">
+          </div>
+        </div>
+      </div>
+      <div id="previo-precio" class="preview-precio-box" style="display:none">
+        Si el freelancer cotiza <strong>$<span id="p-min">0</span>–$<span id="p-max">0</span> USD</strong>,
+        tú pagarás <strong style="color:var(--azul)">$<span id="p-min-c">0</span>–$<span id="p-max-c">0</span> USD</strong>
+        (incluye el 8% de comisión). <strong style="color:var(--verde)">El freelancer recibe el 100% de su precio.</strong>
+      </div>
+      <div class="form-group" style="margin-top:14px">
+        <label class="form-label">Plazo de entrega <span style="color:#ef4444">*</span></label>
+        <select id="pub-plazo" class="form-input">
+          <option value="">Selecciona un plazo...</option>
+          <option>Urgente — Menos de 1 semana</option>
+          <option>1 a 2 semanas</option>
+          <option>3 a 4 semanas</option>
+          <option>1 a 2 meses</option>
+          <option>Más de 2 meses</option>
+          <option>A definir con el freelancer</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="display:flex;justify-content:flex-end;gap:12px;padding-bottom:40px">
+      <button class="btn-ghost" onclick="mostrarPagina('proyectos')">Cancelar</button>
+      <button class="btn-pub-final" id="btn-publicar" onclick="publicarProyecto()">Publicar proyecto →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════
+     PÁGINA: DASHBOARD
+════════════════════════════ -->
+<div class="pagina" id="pag-dashboard"></div>
+
+<!-- ── MODAL AUTH ─────────────────────────────────────── -->
+<div id="auth-overlay" onclick="cerrarAuth(event)">
+  <div class="auth-modal">
+    <div class="auth-header">
+      <h2>Crear cuenta gratis</h2>
+      <button class="btn-cerrar-modal" onclick="document.getElementById('auth-overlay').style.display='none'">×</button>
+    </div>
+    <div class="auth-tabs-modal">
+      <button class="tab-btn activo" id="btn-reg"   onclick="switchTab('reg')">Crear cuenta</button>
+      <button class="tab-btn"        id="btn-login" onclick="switchTab('login')">Iniciar sesión</button>
+    </div>
+    <div class="auth-body">
+      <div id="err"></div>
+      <div id="tab-reg">
+        <p style="font-size:.8rem;color:var(--muted);margin-bottom:10px">¿Cómo usarás Freelko?</p>
+        <div class="rol-selector">
+          <button class="rol-btn activo" data-rol="freelancer" onclick="selRol('freelancer')"><span class="rol-icono">💼</span>Soy freelancer</button>
+          <button class="rol-btn" data-rol="client" onclick="selRol('client')"><span class="rol-icono">🏢</span>Soy cliente</button>
+        </div>
+        <div class="form-group"><label class="form-label">Nombre completo</label><input type="text" id="r-nombre" class="form-input" placeholder="Tu nombre completo"></div>
+        <div class="form-group"><label class="form-label">Correo electrónico</label><input type="email" id="r-email" class="form-input" placeholder="correo@ejemplo.com"></div>
+        <div class="form-group"><label class="form-label">Contraseña</label><input type="password" id="r-pass" class="form-input" placeholder="Mínimo 8 caracteres"></div>
+        <button class="btn-primary" onclick="registrar()">Crear cuenta gratuita →</button>
+        <div class="divider-auth">o</div>
+        <button class="btn-google-auth" onclick="loginGoogle()">
+          <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/></svg>
+          Continuar con Google
+        </button>
+        <p class="auth-nota">Al registrarte aceptas los Términos y Política de privacidad de Freelko</p>
+      </div>
+      <div id="tab-login" style="display:none">
+        <div class="form-group"><label class="form-label">Correo</label><input type="email" id="l-email" class="form-input" placeholder="correo@ejemplo.com"></div>
+        <div class="form-group"><label class="form-label">Contraseña</label><input type="password" id="l-pass" class="form-input" placeholder="Tu contraseña"></div>
+        <button class="btn-primary" onclick="login()">Iniciar sesión →</button>
+        <div class="divider-auth">o</div>
+        <button class="btn-google-auth" onclick="loginGoogle()">
+          <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/></svg>
+          Continuar con Google
+        </button>
+        <p class="auth-nota">¿No tienes cuenta? <a href="#" onclick="switchTab('reg')" style="color:var(--azul);font-weight:600">Regístrate gratis</a></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+window.actualizarPrevio = () => {
+  const min=parseFloat(document.getElementById('pub-min').value)||0;
+  const max=parseFloat(document.getElementById('pub-max').value)||0;
+  const box=document.getElementById('previo-precio');
+  if(min>0||max>0){
+    box.style.display='block';
+    document.getElementById('p-min').textContent=min.toLocaleString();
+    document.getElementById('p-max').textContent=max.toLocaleString();
+    document.getElementById('p-min-c').textContent=(min*1.08).toFixed(2);
+    document.getElementById('p-max-c').textContent=(max*1.08).toFixed(2);
+  } else { box.style.display='none'; }
+};
+
+// Actualizar el nombre en el menú desplegable al cargar
+document.addEventListener('DOMContentLoaded', () => {
+  // El listener de Firebase actualiza todo automáticamente
+});
+</script>
+</body>
+</html>
